@@ -1,231 +1,168 @@
 /**
- * Open Dataset Collection Engine
+ * G0DM0D3 Research Preview API
  *
- * Opt-in data collection for building an open source research dataset.
- * Researchers who enable `contribute_to_dataset: true` in their requests
- * have their (anonymized) interaction data stored for the community.
+ * Exposes the core engines (AutoTune, Parseltongue, STM, Feedback Loop)
+ * and the flagship ULTRAPLINIAN multi-model racing mode as a REST API.
  *
- * Stored data:
- * - Messages sent and received (no API keys, no IPs)
- * - AutoTune parameters and context detection results
- * - Model used and response metadata
- * - User feedback/ratings
- * - Parseltongue and STM pipeline metadata
+ * Includes opt-in dataset collection for building an open source research dataset.
  *
- * Privacy guarantees:
- * - Strictly opt-in per request
- * - No PII: API keys, IPs, and auth tokens are NEVER stored
- * - Dataset is exportable via GET /v1/dataset/export
- * - Caller can request deletion via DELETE /v1/dataset/:id
- *
- * Persistence: auto-publishes to HuggingFace when buffer fills up.
+ * Designed for deployment on Hugging Face Spaces (Docker) or any container host.
  */
 
-import { randomUUID } from 'crypto'
-import { registerDatasetStore, checkDatasetThreshold } from './hf-publisher'
+import express from 'express'
+import cors from 'cors'
+import path from 'path'
+import { rateLimit } from './middleware/rateLimit'
+import { apiKeyAuth } from './middleware/auth'
+import { autotuneRoutes } from './routes/autotune'
+import { parseltongueRoutes } from './routes/parseltongue'
+import { transformRoutes } from './routes/transform'
+import { chatRoutes } from './routes/chat'
+import { completionsRoutes } from './routes/completions'
+import { modelsRoutes } from './routes/models'
+import { feedbackRoutes } from './routes/feedback'
+import { ultraplinianRoutes } from './routes/ultraplinian'
+import { datasetRoutes } from './routes/dataset'
+import { metadataRoutes } from './routes/metadata'
 
-// ── Types ────────────────────────────────────────────────────────────
+const app = express()
+const PORT = parseInt(process.env.PORT || '7860', 10) // HF Spaces default
 
-export interface DatasetEntry {
-  id: string
-  timestamp: number
+// ── Middleware ─────────────────────────────────────────────────────────
+app.use(cors({
+  origin: process.env.CORS_ORIGIN === '*'
+    ? true
+    : [process.env.CORS_ORIGIN || 'https://godmod3.ai'].filter(Boolean),
+  credentials: false,
+}))
+app.use(express.json({ limit: '1mb' }))
 
-  // Request metadata
-  endpoint: string  // which API endpoint was called
-  model: string
-  mode: 'standard' | 'ultraplinian'
+// ── Static UI ─────────────────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')))
 
-  // Messages (stripped of system prompts to avoid leaking custom prompts)
-  messages: Array<{ role: string; content: string }>
-  response: string
-
-  // AutoTune data
-  autotune?: {
-    strategy: string
-    detected_context: string
-    confidence: number
-    params: Record<string, number>
-    reasoning: string
-  }
-
-  // Parseltongue data
-  parseltongue?: {
-    triggers_found: string[]
-    technique_used: string
-    transformations_count: number
-  }
-
-  // STM data
-  stm?: {
-    modules_applied: string[]
-  }
-
-  // ULTRAPLINIAN race data
-  ultraplinian?: {
-    tier: string
-    models_queried: string[]
-    winner_model: string
-    all_scores: Array<{ model: string; score: number; duration_ms: number; success: boolean }>
-    total_duration_ms: number
-  }
-
-  // Feedback (added later via POST /v1/feedback if user rates)
-  feedback?: {
-    rating: 1 | -1
-    heuristics?: {
-      response_length: number
-      repetition_score: number
-      vocabulary_diversity: number
-    }
-  }
-}
-
-// ── In-Memory Store with Auto-Publish ────────────────────────────────
-// Buffer auto-flushes to HuggingFace when it hits 80% capacity.
-// Falls back to FIFO eviction if HF publishing is not configured.
-
-let dataset: DatasetEntry[] = []
-const MAX_ENTRIES = 10000 // Cap to prevent unbounded memory growth
-
-// Track how many entries have been flushed so we can use index-based draining
-// instead of copying the entire array on each snapshot.
-let datasetFlushIndex = 0
-
-// Register with HF publisher so it can snapshot/clear our buffer
-registerDatasetStore({
-  snapshot: () => dataset.slice(datasetFlushIndex),
-  clear: (count: number) => {
-    datasetFlushIndex += count
-    // Compact the array when more than half has been drained to free memory
-    if (datasetFlushIndex > dataset.length / 2) {
-      dataset = dataset.slice(datasetFlushIndex)
-      datasetFlushIndex = 0
-    }
-  },
+// ── Health / Info (no auth required) ──────────────────────────────────
+app.get('/v1/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: Date.now() })
 })
 
-// ── PII Scrubber ────────────────────────────────────────────────────
-// Best-effort removal of common PII patterns before data hits the buffer.
-// Not perfect — users are warned to avoid submitting PII regardless.
+app.get('/v1/info', (_req, res) => {
+  res.json({
+    name: 'G0DM0D3 Research Preview API',
+    version: '0.4.0',
+    description: 'OpenAI-compatible API for ULTRAPLINIAN multi-model racing. Use any OpenAI SDK — just swap the base_url.',
+    license: 'AGPL-3.0',
+    quickstart: {
+      python: [
+        'from openai import OpenAI',
+        'client = OpenAI(base_url="<THIS_URL>/v1", api_key="<YOUR_KEY>")',
+        'r = client.chat.completions.create(model="ultraplinian", messages=[{"role":"user","content":"Hello"}])',
+        'print(r.choices[0].message.content)',
+      ],
+      curl: 'curl <THIS_URL>/v1/chat/completions -H "Authorization: Bearer <KEY>" -H "Content-Type: application/json" -d \'{"model":"ultraplinian","messages":[{"role":"user","content":"Hello"}]}\'',
+    },
+    models: {
+      'ultraplinian':          'Race 12 models, return the best (fast tier)',
+      'ultraplinian-fast':     'Same as ultraplinian',
+      'ultraplinian-standard': 'Race 20 models (standard tier)',
+      'ultraplinian-full':     'Race 27 models (full tier)',
+      '<any-openrouter-model>': 'Single-model with GODMODE pipeline (e.g. openai/gpt-4o)',
+    },
+    endpoints: {
+      'POST /v1/chat/completions':         'OpenAI-compatible — works with any SDK (model routing built in)',
+      'GET  /v1/models':                   'OpenAI-compatible — list available models',
+      'POST /v1/ultraplinian/completions':  'Raw ULTRAPLINIAN with Liquid Response SSE (power users)',
+      'POST /v1/autotune/analyze':          'Analyze message context and compute optimal LLM parameters',
+      'POST /v1/parseltongue/encode':       'Obfuscate trigger words in text',
+      'POST /v1/parseltongue/detect':       'Detect trigger words in text',
+      'POST /v1/transform':                 'Apply semantic transformation modules to text',
+      'POST /v1/feedback':                  'Submit quality feedback for the EMA learning loop',
+      'GET  /v1/dataset/stats':             'Dataset collection statistics',
+      'GET  /v1/dataset/export':            'Export the open research dataset (JSON or JSONL)',
+      'GET  /v1/metadata/stats':            'ZDR usage analytics (models, latency, pipeline stats — no content)',
+      'GET  /v1/metadata/events':           'Raw metadata event log (paginated, content-free)',
+    },
+    authentication: {
+      openrouter_key: process.env.OPENROUTER_API_KEY
+        ? 'Server-provided (callers do NOT need their own OpenRouter key)'
+        : 'Caller must provide openrouter_api_key in request body (or extra_body in Python SDK)',
+      api_key: 'Send Authorization: Bearer <your-api-key> header',
+    },
+    extra_body_options: {
+      note: 'Pass G0DM0D3-specific options via extra_body in the OpenAI Python SDK',
+      options: {
+        godmode: 'boolean (default: true) — enable GODMODE system prompt',
+        autotune: 'boolean (default: true) — auto-tune parameters to context',
+        strategy: "'adaptive'|'precise'|'balanced'|'creative'|'chaotic' (default: adaptive)",
+        parseltongue: 'boolean (default: true) — obfuscate trigger words',
+        stm_modules: "string[] (default: ['hedge_reducer','direct_mode']) — post-processing",
+        previous_winner: 'string — model ID to prioritize in ultraplinian race',
+        openrouter_api_key: 'string — your OpenRouter key (if server does not provide one)',
+      },
+    },
+    limits: {
+      requests_total: parseInt(process.env.RATE_LIMIT_TOTAL || '5', 10) || 'unlimited',
+      requests_per_minute: 60,
+      requests_per_day: 1000,
+      note: 'Research preview — each API key gets 5 total requests by default. Set RATE_LIMIT_TOTAL=0 to uncap.',
+    },
+    source: 'https://github.com/LYS10S/G0DM0D3',
+  })
+})
 
-const PII_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
-  // Email addresses
-  { pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, replacement: '[EMAIL_REDACTED]' },
-  // Phone numbers (US and international formats)
-  { pattern: /(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}/g, replacement: '[PHONE_REDACTED]' },
-  { pattern: /\+[0-9]{1,3}[-.\s]?[0-9]{4,14}/g, replacement: '[PHONE_REDACTED]' },
-  // SSN (US)
-  { pattern: /\b[0-9]{3}[-\s]?[0-9]{2}[-\s]?[0-9]{4}\b/g, replacement: '[SSN_REDACTED]' },
-  // Credit card numbers (13-19 digits with optional separators)
-  { pattern: /\b(?:[0-9]{4}[-\s]?){3,4}[0-9]{1,4}\b/g, replacement: '[CC_REDACTED]' },
-  // IPv4 addresses
-  { pattern: /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g, replacement: '[IP_REDACTED]' },
-  // IPv6 addresses (simplified)
-  { pattern: /\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g, replacement: '[IP_REDACTED]' },
-  // API keys (common patterns: sk-, pk-, key-, bearer tokens)
-  { pattern: /\b(?:sk|pk|api[_-]?key)[_-][a-zA-Z0-9]{20,}\b/gi, replacement: '[APIKEY_REDACTED]' },
-  { pattern: /\bBearer\s+[a-zA-Z0-9._-]{20,}\b/g, replacement: 'Bearer [TOKEN_REDACTED]' },
-  // AWS access keys
-  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: '[AWS_KEY_REDACTED]' },
-]
+// ── OpenAI-compatible routes (primary API surface) ────────────────────
+app.use('/v1/chat', apiKeyAuth, rateLimit, completionsRoutes)
+app.use('/v1/models', apiKeyAuth, modelsRoutes) // no rate limit on model listing
 
-function scrubPII(text: string): string {
-  let result = text
-  for (const { pattern, replacement } of PII_PATTERNS) {
-    // Reset lastIndex for global regexes
-    pattern.lastIndex = 0
-    result = result.replace(pattern, replacement)
-  }
-  return result
-}
+// ── Power-user routes (raw formats, Liquid Response SSE) ──────────────
+app.use('/v1/ultraplinian', apiKeyAuth, rateLimit, ultraplinianRoutes)
+app.use('/v1/raw/chat', apiKeyAuth, rateLimit, chatRoutes) // legacy raw format
 
-function scrubEntryPII(entry: Omit<DatasetEntry, 'id' | 'timestamp'>): Omit<DatasetEntry, 'id' | 'timestamp'> {
-  return {
-    ...entry,
-    messages: entry.messages.map(m => ({
-      ...m,
-      content: typeof m.content === 'string' ? scrubPII(m.content) : m.content,
-    })),
-    response: scrubPII(entry.response),
-  }
-}
+// ── Engine routes ─────────────────────────────────────────────────────
+app.use('/v1/autotune', apiKeyAuth, rateLimit, autotuneRoutes)
+app.use('/v1/parseltongue', apiKeyAuth, rateLimit, parseltongueRoutes)
+app.use('/v1/transform', apiKeyAuth, rateLimit, transformRoutes)
+app.use('/v1/feedback', apiKeyAuth, rateLimit, feedbackRoutes)
+app.use('/v1/dataset', apiKeyAuth, rateLimit, datasetRoutes)
+app.use('/v1/metadata', apiKeyAuth, metadataRoutes) // no rate limit — read-only analytics
 
-// ── Public API ───────────────────────────────────────────────────────
+// ── 404 ───────────────────────────────────────────────────────────────
+app.use((_req, res) => {
+  res.status(404).json({ error: 'Not found. See GET /v1/info for available endpoints.' })
+})
 
-export function addEntry(entry: Omit<DatasetEntry, 'id' | 'timestamp'>): string {
-  const id = randomUUID()
-  const scrubbed = scrubEntryPII(entry)
-  const record: DatasetEntry = {
-    ...scrubbed,
-    id,
-    timestamp: Date.now(),
-  }
+// ── Error handler ─────────────────────────────────────────────────────
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('[API Error]', err.message)
+  res.status(500).json({ error: 'Internal server error' })
+})
 
-  dataset.push(record)
+// ── Start ─────────────────────────────────────────────────────────────
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+  ╔══════════════════════════════════════════════════════════╗
+  ║  G0DM0D3 API v0.4.0 — OpenAI-Compatible                 ║
+  ║  http://0.0.0.0:${String(PORT).padEnd(5)}                                  ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║                                                          ║
+  ║  OPENAI-COMPATIBLE (use any SDK):                        ║
+  ║  POST /v1/chat/completions   model="ultraplinian"        ║
+  ║  GET  /v1/models             list available models        ║
+  ║                                                          ║
+  ║  POWER USER:                                             ║
+  ║  POST /v1/ultraplinian/completions  Raw SSE race         ║
+  ║                                                          ║
+  ║  ENGINES:                                                ║
+  ║  POST /v1/autotune/analyze     Context analysis          ║
+  ║  POST /v1/parseltongue/encode  Text obfuscation          ║
+  ║  POST /v1/transform            STM transforms            ║
+  ║  POST /v1/feedback             Feedback loop             ║
+  ║                                                          ║
+  ║  QUICKSTART:                                             ║
+  ║  from openai import OpenAI                               ║
+  ║  c = OpenAI(base_url=".../v1", api_key="g0d_...")        ║
+  ║  c.chat.completions.create(model="ultraplinian", ...)    ║
+  ╚══════════════════════════════════════════════════════════╝
+  `)
+})
 
-  // Auto-flush to HF when approaching capacity (async, non-blocking)
-  checkDatasetThreshold(dataset.length, MAX_ENTRIES)
-
-  // Evict oldest entries if over cap (fallback if HF not configured or failed)
-  if (dataset.length > MAX_ENTRIES) {
-    dataset = dataset.slice(dataset.length - MAX_ENTRIES)
-  }
-
-  return id
-}
-
-export function addFeedbackToEntry(
-  entryId: string,
-  feedback: DatasetEntry['feedback'],
-): boolean {
-  const entry = dataset.find(e => e.id === entryId)
-  if (!entry) return false
-  entry.feedback = feedback
-  return true
-}
-
-export function deleteEntry(id: string): boolean {
-  const idx = dataset.findIndex(e => e.id === id)
-  if (idx === -1) return false
-  dataset.splice(idx, 1)
-  return true
-}
-
-export function getDataset(): DatasetEntry[] {
-  return [...dataset]
-}
-
-export function getDatasetStats(): {
-  total_entries: number
-  entries_with_feedback: number
-  mode_breakdown: Record<string, number>
-  model_breakdown: Record<string, number>
-  context_breakdown: Record<string, number>
-  oldest_entry: number | null
-  newest_entry: number | null
-} {
-  const modeBreakdown: Record<string, number> = {}
-  const modelBreakdown: Record<string, number> = {}
-  const contextBreakdown: Record<string, number> = {}
-  let withFeedback = 0
-
-  for (const entry of dataset) {
-    modeBreakdown[entry.mode] = (modeBreakdown[entry.mode] || 0) + 1
-    modelBreakdown[entry.model] = (modelBreakdown[entry.model] || 0) + 1
-    if (entry.autotune?.detected_context) {
-      const ctx = entry.autotune.detected_context
-      contextBreakdown[ctx] = (contextBreakdown[ctx] || 0) + 1
-    }
-    if (entry.feedback) withFeedback++
-  }
-
-  return {
-    total_entries: dataset.length,
-    entries_with_feedback: withFeedback,
-    mode_breakdown: modeBreakdown,
-    model_breakdown: modelBreakdown,
-    context_breakdown: contextBreakdown,
-    oldest_entry: dataset.length > 0 ? dataset[0].timestamp : null,
-    newest_entry: dataset.length > 0 ? dataset[dataset.length - 1].timestamp : null,
-  }
-}
+export default app
