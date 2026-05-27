@@ -201,4 +201,4 @@ Contributions are welcome! Please submit PRs.
 Made with 🖤 by Pliny the Prompter
 
 
-##  https://akhack7.github.io/Tools/
+##  https://akhack7.github.io/Tools/index
